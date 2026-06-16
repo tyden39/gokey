@@ -1,0 +1,6 @@
+github.com/BambooEngine/bamboo-core v0.0.0-20240916131919-b2e49a2b48c7 h1:sXj2UzNjOxmX4xxk8bLWMECamsKn8vT3XSe1klDvsV0=
+github.com/BambooEngine/bamboo-core v0.0.0-20240916131919-b2e49a2b48c7/go.mod h1:OxsVN3QJM/OrAVsnsSrSTC2SOudVOrb0vTw1dJrcOK4=
+github.com/rajveermalviya/go-wayland/wayland v0.0.0-20230130181619-0ad78d1310b2 h1:tRhbehjSCwQSZL7A2AoZlKrDYhZzaPIAcpnhfaUc0Tw=
+github.com/rajveermalviya/go-wayland/wayland v0.0.0-20230130181619-0ad78d1310b2/go.mod h1:PXhW/GoWcMBeiZ39ZdgoMs/xduJEEUE+kxUBB2Kwd+M=
+golang.org/x/sys v0.0.0-20211117180635-dee7805ff2e1 h1:kwrAHlwJ0DUBZwQ238v+Uod/3eZ8B2K5rYsUHBQvzmI=
+golang.org/x/sys v0.0.0-20211117180635-dee7805ff2e1/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
