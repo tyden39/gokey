@@ -16,7 +16,8 @@ GOKEY_DEBUG=1 ./gokey       # run with key-by-key debug logging
 ```
 
 Only one input method can run at a time — stop fcitx5/ibus before running gokey.
-Toggle Vietnamese with **Ctrl+Shift**.
+Toggle Vietnamese with **Ctrl+Shift**. Toggle direct-commit ↔ preedit mode with
+**Ctrl+Shift+Space** (direct is the default).
 
 ## Layout
 
@@ -41,9 +42,17 @@ Toggle Vietnamese with **Ctrl+Shift**.
   text-input (drun launchers: wofi/fuzzel/rofi, layer-shell overlays), gokey must
   `forward()` raw keys, never `commit_string` — else keys get swallowed.
 - `forward()` silently drops keys if `!keymapSet` — watch for that when "nothing types".
+- **Two composition modes, toggled by Ctrl+Shift+Space (`a.preedit`).** Direct
+  (default): each key applies a (delete, insert) diff live via `apply` (fake
+  Backspace + `commit_string`); works in terminals. Preedit: word shown via
+  `set_preedit_string` (`setPreedit`) and committed on word-end (`flushPreedit`);
+  no Backspace race but terminals may not render it. `endWord` ends the current
+  word per mode (flush vs reset); both the vnOn toggle and word-ending keys call
+  it. Switching modes flushes the in-progress word so nothing is left dangling.
 
 ## Conventions
 
 - Keep files focused; engine logic stays in `engine/`, Wayland/inject in `main.go`.
 - Conventional commits, no AI references.
-- Don't add a preedit/inject mode without deciding the terminal-vs-GUI trade-off first.
+- Preedit mode exists as an opt-in toggle (default off) so the terminal-vs-GUI
+  trade-off stays the user's choice; keep direct mode the default.

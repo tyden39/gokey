@@ -36,10 +36,11 @@ type app struct {
 	grab *inputmethod.ZwpInputMethodKeyboardGrabV2
 	vk   *virtualkeyboard.ZwpVirtualKeyboardV1
 
-	tx     *engine.Telex
-	serial uint32
-	vnOn   bool
-	active bool
+	tx      *engine.Telex
+	serial  uint32
+	vnOn    bool
+	active  bool
+	preedit bool // false: commit live diff; true: show set_preedit_string
 
 	keymapSet bool
 	consumed  map[uint32]bool
@@ -79,7 +80,7 @@ func main() {
 		log.Fatal("compositor missing input-method-v2 or virtual-keyboard-v1 support")
 	}
 	a.setup()
-	log.Printf("gokey running (Telex, Vietnamese=%v, toggle=Ctrl+Shift)", a.vnOn)
+	log.Printf("gokey running (Telex, Vietnamese=%v, toggle=Ctrl+Shift, preedit toggle=Ctrl+Shift+Space)", a.vnOn)
 
 	for {
 		if err := a.ctx.Dispatch(); err != nil {
@@ -199,9 +200,16 @@ func (a *app) onKey(e inputmethod.ZwpInputMethodKeyboardGrabV2KeyEvent) {
 
 	a.chordOther = true
 
+	// Ctrl+Shift+Space toggles between direct-commit and preedit modes.
+	if code == keymap.KeySpace && a.ctrl && a.shift && !a.alt && !a.super {
+		a.togglePreedit()
+		a.consumed[code] = true
+		return
+	}
+
 	if !a.active || !a.vnOn || a.ctrl || a.alt || a.super {
 		if a.ctrl || a.alt || a.super {
-			a.tx.Reset()
+			a.endWord()
 		}
 		a.forward(e)
 		return
@@ -210,7 +218,11 @@ func (a *app) onKey(e inputmethod.ZwpInputMethodKeyboardGrabV2KeyEvent) {
 	if code == keymap.KeyBackspace {
 		dbg("backspace received (word empty=%v)", a.tx.Empty())
 		if del, ins, handled := a.tx.Backspace(); handled {
-			a.apply(del, ins)
+			if a.preedit {
+				a.setPreedit(a.tx.Current())
+			} else {
+				a.apply(del, ins)
+			}
 			a.consumed[code] = true
 			return
 		}
@@ -224,12 +236,17 @@ func (a *app) onKey(e inputmethod.ZwpInputMethodKeyboardGrabV2KeyEvent) {
 		}
 		del, ins := a.tx.ProcessChar(r)
 		dbg("letter %q -> delete %d, insert %q", r, del, ins)
-		a.apply(del, ins)
+		if a.preedit {
+			a.setPreedit(a.tx.Current())
+		} else {
+			a.apply(del, ins)
+		}
 		a.consumed[code] = true
 		return
 	}
 
-	a.tx.Reset()
+	// A non-letter key (space, punctuation, Enter) ends the word.
+	a.endWord()
 	a.forward(e)
 }
 
@@ -245,6 +262,49 @@ func (a *app) apply(deleteRunes int, insert string) {
 		a.im.CommitString(insert)
 		a.im.Commit(a.serial)
 	}
+}
+
+// setPreedit shows the in-progress word as underlined preedit text instead of
+// committing it. The compositor replaces the whole preedit atomically each
+// time, so there are no fake Backspaces and no ordering race. Used only in
+// preedit mode. The cursor sits at the end of the word.
+func (a *app) setPreedit(word string) {
+	a.im.SetPreeditString(word, int32(len(word)), int32(len(word)))
+	a.im.Commit(a.serial)
+}
+
+// flushPreedit commits the current composing word as real text and clears the
+// preedit. Called when a word ends or when leaving preedit mode. No-op against
+// the application when not focused; the engine is reset either way.
+func (a *app) flushPreedit() {
+	if a.active {
+		word := a.tx.Current()
+		a.im.SetPreeditString("", 0, 0)
+		if word != "" {
+			a.im.CommitString(word)
+		}
+		a.im.Commit(a.serial)
+	}
+	a.tx.Reset()
+}
+
+// endWord finishes the current word. In direct mode the text is already
+// committed live, so this only resets the engine; in preedit mode it commits
+// the pending preedit first.
+func (a *app) endWord() {
+	if a.preedit {
+		a.flushPreedit()
+	} else {
+		a.tx.Reset()
+	}
+}
+
+// togglePreedit switches between direct-commit and preedit modes, flushing any
+// in-progress word so nothing is left half-composed across the switch.
+func (a *app) togglePreedit() {
+	a.endWord()
+	a.preedit = !a.preedit
+	log.Printf("preedit=%v", a.preedit)
 }
 
 func (a *app) sendBackspace() {
@@ -293,7 +353,7 @@ func (a *app) updateModifier(code uint32, pressed bool) {
 	if wasAny && !nowAny {
 		if a.sawCtrlShift && !a.chordOther {
 			a.vnOn = !a.vnOn
-			a.tx.Reset()
+			a.endWord()
 			log.Printf("Vietnamese=%v", a.vnOn)
 		}
 		a.sawCtrlShift = false

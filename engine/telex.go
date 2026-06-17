@@ -29,6 +29,13 @@ func (t *Telex) Empty() bool {
 	return t.displayed == ""
 }
 
+// Current returns the full composed word as it should currently be displayed.
+// Used by preedit mode, which shows the whole word rather than a (delete,
+// insert) diff.
+func (t *Telex) Current() string {
+	return t.displayed
+}
+
 // ProcessChar feeds one letter into the engine and returns the diff needed to
 // turn the currently displayed word into the new one: the number of trailing
 // characters (runes) to delete via Backspace and the string to insert
