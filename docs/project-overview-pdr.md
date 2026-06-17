@@ -31,19 +31,22 @@ standard `zwp_input_method_v2` protocol and commits transformed text directly.
 
 - X11 support (Wayland only).
 - Input methods other than Telex (VNI, VIQR, etc.) — not currently wired up.
-- Preedit/candidate UI, configuration files, or a settings GUI.
-- Coexistence with another active input method on the same seat (must stop fcitx5 first).
+- Candidate UI, configuration files, or a settings GUI. (Preedit is supported as an
+  opt-in mode — see Key Behaviors — but there is no candidate window.)
+- Coexistence with another active input method on the same seat (only one input
+  method may hold the seat at a time).
 
 ## Key Behaviors
 
 | Behavior | Detail |
 |----------|--------|
 | Toggle VN | Press and release **Ctrl+Shift** with no other key in the chord. |
+| Toggle preedit | **Ctrl+Shift+Space** switches direct-commit ↔ preedit mode (direct default). |
 | Passthrough | When VN off, or app inactive, or Ctrl/Alt/Super held → key forwarded as-is. |
 | Composition | Letters fed to Bamboo engine; result applied as minimal byte diff. |
 | Backspace | If composing a word, edits the word; otherwise forwarded to app. |
 | Caps/Shift | Uppercases letters before feeding the engine (`shift XOR capsLock`). |
-| No-IM safety | `run.sh` stops fcitx5 before running, restarts it on exit. |
+| No-IM safety | `run.sh` stops the installed gokey before a dev build, relaunches it on exit. |
 
 ## Requirements
 

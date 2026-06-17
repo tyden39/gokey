@@ -6,7 +6,7 @@
 gokey/
 ├── main.go                                  # Wayland app + key dispatch + toggle (299 LOC)
 ├── go.mod / go.sum                          # module gokey, Go 1.25
-├── run.sh                                   # build + run, swaps out fcitx5 safely
+├── run.sh                                   # build + run dev binary, swaps out installed gokey
 ├── engine/
 │   ├── telex.go                             # Bamboo engine wrapper, diff logic (71 LOC)
 │   └── telex_test.go                        # unit tests for composition/backspace/diff
@@ -62,7 +62,7 @@ engine `tx`, the IM `serial`, and runtime flags:
 ```bash
 go build -o gokey .       # build
 go test ./...             # run engine tests
-./run.sh                  # build + run (stops fcitx5, GOKEY_DEBUG=1)
+./run.sh                  # build + run (stops installed gokey, GOKEY_DEBUG=1)
 GOKEY_DEBUG=1 ./gokey      # run with verbose tracing
 ```
 

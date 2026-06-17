@@ -7,9 +7,9 @@ How gokey is installed and run as the Vietnamese input method on Hyprland.
 - **Binary:** `~/.local/bin/gokey`
 - **Compositor:** Hyprland 0.55.2 (Wayland) — exposes `input-method-v2` + `virtual-keyboard-v1`.
 - **Autostart:** `exec-once = ~/.local/bin/gokey` in `~/.config/hypr/hyprland.conf`.
-- **Replaces:** the previous `exec-once = fcitx5 -d` (kept in
+- **Replaces:** fcitx5, which has been fully removed (old config kept in
   `~/.config/hypr/hyprland.conf.bak.*`). Only one input method may hold a seat at a time.
-- **Toggle Vietnamese:** Ctrl+Shift.
+- **Toggle Vietnamese:** Ctrl+Shift. **Toggle preedit mode:** Ctrl+Shift+Space.
 
 ## Install / Update
 
@@ -55,26 +55,24 @@ runs on Hyprland start; use `hyprctl dispatch exec` to (re)launch without a rest
 gokey is autostarted at boot via `exec-once = ~/.local/bin/gokey` in
 `~/.config/hypr/hyprland.conf`. That instance holds the seat, and **only one input
 method (`zwp_input_method_v2` grab) may be active at a time**. So before running a
-freshly built `./gokey` (or `./run.sh`), you MUST stop the autostarted one — otherwise
-the new process hits `SetUnavailableHandler` → `log.Fatal("input method unavailable")`
-and exits immediately.
+freshly built `./gokey`, the autostarted one must stop — otherwise the new process
+hits `SetUnavailableHandler` → `log.Fatal("input method unavailable")` and exits
+immediately.
 
 ```bash
-pkill -x gokey      # stop the autostarted (installed) instance
 ./run.sh            # build + run dev binary in foreground (GOKEY_DEBUG=1)
 ```
 
 Notes:
-- `run.sh` only stops/restarts **fcitx5**, not gokey — killing gokey is on you.
-- On exit, `run.sh`'s trap restarts fcitx5, not gokey. To return to the boot state:
-  `hyprctl dispatch exec '~/.local/bin/gokey'` (or just relog/reboot).
+- `run.sh` stops the installed gokey before running the dev binary, and on exit
+  relaunches the installed instance via `hyprctl dispatch exec` so you return to the
+  boot state automatically.
 - To make a tested fix permanent, install it: see [Install / Update](#install--update).
 
 ## Verify
 
 ```bash
 pgrep -x gokey                  # should print exactly one PID
-pgrep -x fcitx5 || echo "no fcitx5"   # must NOT be running (would steal the seat)
 ```
 
 Functional test — open a Wayland app using text-input-v3 and type `tieesng vieejt`:
@@ -92,7 +90,7 @@ after stopping the autostarted instance).
 
 | Symptom | Cause / Fix |
 |---------|-------------|
-| Log: `input method unavailable: another input method ... already active` | Another IM (fcitx5/ibus, or a second gokey) holds the seat. `pkill -x fcitx5; pkill -x ibus-daemon`, ensure only one gokey runs, relaunch. |
+| Log: `input method unavailable: another input method ... already active` | Another IM (a second gokey, or a leftover ibus) holds the seat. Ensure only one gokey runs (`pkill -x gokey`), then relaunch. |
 | Log: `compositor missing input-method-v2 or virtual-keyboard-v1 support` | Compositor doesn't expose the protocols. Hyprland/Sway/river do; some others don't. |
 | Vietnamese not transformed in an app | App isn't using text-input-v3 (e.g. an XWayland/X11 app, or one forced to a toolkit IM module). Native Wayland GTK/Qt apps with empty IM modules work. |
 | Old behavior after a code change | Deployed `~/.local/bin/gokey` is stale — rebuild and `cp`, then reload. |
@@ -100,6 +98,7 @@ after stopping the autostarted instance).
 
 ## Notes
 
-- `run.sh` is for **development** (it stops/restarts fcitx5 around a foreground run with
-  debug). For the persistent session IME, the `exec-once` autostart above is what's used.
+- `run.sh` is for **development** (it stops the installed gokey, runs a foreground
+  debug build, and relaunches the installed one on exit). For the persistent session
+  IME, the `exec-once` autostart above is what's used.
 - Wayland only; Telex only. See [system-architecture.md](system-architecture.md) for design.

@@ -11,11 +11,12 @@ Telex transform is delegated to `bamboo-core`.
 ```bash
 go build -o gokey .         # build
 go test ./engine            # run engine tests (Telex transform)
-./run.sh                    # stops fcitx5, builds, runs gokey with GOKEY_DEBUG=1
+./run.sh                    # stops installed gokey, builds, runs dev binary (GOKEY_DEBUG=1)
 GOKEY_DEBUG=1 ./gokey       # run with key-by-key debug logging
 ```
 
-Only one input method can run at a time — stop fcitx5/ibus before running gokey.
+Only one input method can run at a time — stop the installed/autostarted gokey
+before running a dev build (`run.sh` does this for you).
 Toggle Vietnamese with **Ctrl+Shift**. Toggle direct-commit ↔ preedit mode with
 **Ctrl+Shift+Space** (direct is the default).
 

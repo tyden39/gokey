@@ -23,15 +23,15 @@ transformed Vietnamese text directly.
 - Linux + a **Wayland compositor** exposing both `zwp_input_method_manager_v2` and
   `zwp_virtual_keyboard_manager_v1` (e.g. Sway, Hyprland, river).
 - **Go 1.25+** to build.
-- No other input method holding the seat's input-method slot (stop fcitx5 first — `run.sh`
-  does this for you).
+- No other input method holding the seat's input-method slot (`run.sh` stops the
+  installed/autostarted gokey for you before running a dev build).
 
 ## Build & Run
 
 ```bash
 go build -o gokey .          # build
 go test ./...                # run engine unit tests
-./run.sh                     # build + run (stops fcitx5, restarts on exit, debug on)
+./run.sh                     # build + run (stops installed gokey, relaunches on exit, debug on)
 ```
 
 Or run directly:
@@ -72,7 +72,7 @@ diff** to already-committed text in one atomic input-method commit. See
 | `internal/keymap/` | evdev keycode → letter mapping, modifier constants. |
 | `internal/inputmethod/`, `internal/virtualkeyboard/` | Generated Wayland protocol bindings. |
 | `protocols/*.xml` | Source specs for the generated bindings. |
-| `run.sh` | Build + run, safely swapping out fcitx5. |
+| `run.sh` | Build + run dev binary, swapping out the installed gokey instance. |
 
 ## Documentation
 
