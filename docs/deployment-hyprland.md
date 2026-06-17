@@ -50,6 +50,26 @@ would route apps to a different (absent) IM and Vietnamese typing would not work
 out/in (or restart Hyprland) for the env vars to apply to your whole session. `exec-once`
 runs on Hyprland start; use `hyprctl dispatch exec` to (re)launch without a restart.
 
+## Testing a dev build
+
+gokey is autostarted at boot via `exec-once = ~/.local/bin/gokey` in
+`~/.config/hypr/hyprland.conf`. That instance holds the seat, and **only one input
+method (`zwp_input_method_v2` grab) may be active at a time**. So before running a
+freshly built `./gokey` (or `./run.sh`), you MUST stop the autostarted one — otherwise
+the new process hits `SetUnavailableHandler` → `log.Fatal("input method unavailable")`
+and exits immediately.
+
+```bash
+pkill -x gokey      # stop the autostarted (installed) instance
+./run.sh            # build + run dev binary in foreground (GOKEY_DEBUG=1)
+```
+
+Notes:
+- `run.sh` only stops/restarts **fcitx5**, not gokey — killing gokey is on you.
+- On exit, `run.sh`'s trap restarts fcitx5, not gokey. To return to the boot state:
+  `hyprctl dispatch exec '~/.local/bin/gokey'` (or just relog/reboot).
+- To make a tested fix permanent, install it: see [Install / Update](#install--update).
+
 ## Verify
 
 ```bash
