@@ -1,71 +1,93 @@
 # gokey — Project Overview & PDR
 
-## What It Is
+## What it is
 
-`gokey` is a Vietnamese **Telex** input method for **Wayland** compositors, written in Go.
-It lets users type Vietnamese (e.g. `tieesng vieejt` → `tiếng việt`) in any Wayland
-application that supports the `text-input-v3` protocol, without needing a heavyweight
-input-method framework (IBus/fcitx5).
+gokey is a Vietnamese Telex input method for Wayland, written in Go. It is a
+single binary with no daemon framework (no IBus, no fcitx5). It speaks two
+standard Wayland protocols directly:
 
-- **Module:** `gokey` (Go 1.25+)
-- **Binary:** `gokey` (single static-ish binary)
-- **Input method:** Telex (via [BambooEngine/bamboo-core](https://github.com/BambooEngine/bamboo-core))
-- **Platform:** Linux + Wayland only (uses `wl_seat`, `input-method-v2`, `virtual-keyboard-v1`)
+- `zwp_input_method_v2` — grabs the keyboard, receives raw key/modifier
+  events, and commits transformed text (`commit_string`) or shows in-progress
+  text (`set_preedit_string`) to the focused application.
+- `zwp_virtual_keyboard_v1` — forwards keys the input method doesn't need to
+  transform (shortcuts, punctuation, navigation) and sends synthetic
+  Backspace key events to erase already-committed characters so they can be
+  replaced with the correct diacritics.
 
-## Problem
+The actual Telex transform (letter sequence → Vietnamese word, tones,
+diacritics, `đ`) is delegated to the `github.com/BambooEngine/bamboo-core`
+library; gokey's own code is the Wayland glue plus a thin wrapper that turns
+Bamboo's engine calls into a minimal (delete, insert) diff.
 
-On Wayland, typing Vietnamese normally requires IBus or fcitx5 plus an engine
-(e.g. ibus-bamboo). These are large, stateful, and can conflict. `gokey` is a
-minimal, self-contained alternative: one Go binary that grabs the keyboard via the
-standard `zwp_input_method_v2` protocol and commits transformed text directly.
+## Why it exists
 
-## Goals
+Existing Vietnamese IMEs on Linux (`ibus-bamboo`, `fcitx5-bamboo`) require a
+full input framework daemon and per-toolkit IM modules (`GTK_IM_MODULE`,
+`QT_IM_MODULE`), which are X11-era mechanisms that don't reliably work with
+native Wayland `text-input-v3` clients. gokey targets compositors that
+already expose `zwp_input_method_v2` and `zwp_virtual_keyboard_v1` (Hyprland,
+Sway, river) and needs nothing else installed.
 
-- Correct Telex composition for common Vietnamese words (tones, diacritics, `đ`).
-- Work in real apps (terminals, browsers) using **no preedit** — text is committed
-  and patched in place via `delete_surrounding_text` + `commit_string` diffs.
-- Toggle Vietnamese on/off with a single chord: **Ctrl+Shift**.
-- Stay tiny and dependency-light; pass through all non-Vietnamese keys unchanged.
+## Goals (non-negotiable)
 
-## Non-Goals
+- Correct Telex composition (tones, diacritics, `đ`, uppercase) via
+  bamboo-core, matching what `ibus-bamboo`/`fcitx5-bamboo` users expect.
+- Work in both terminal emulators and GUI text fields without corrupting
+  already-typed text.
+- Never swallow keystrokes in apps that have no text-input focus (application
+  launchers such as wofi/fuzzel, layer-shell overlays) — a launcher that eats
+  keys is worse than no IME at all.
+- Toggle Vietnamese on/off instantly with a keyboard chord, no restart.
+- Stay small enough that one person can read the whole codebase in one
+  sitting.
 
-- X11 support (Wayland only).
-- Input methods other than Telex (VNI, VIQR, etc.) — not currently wired up.
-- Candidate UI, configuration files, or a settings GUI. (Preedit is supported as an
-  opt-in mode — see Key Behaviors — but there is no candidate window.)
-- Coexistence with another active input method on the same seat (only one input
-  method may hold the seat at a time).
+## Non-goals
 
-## Key Behaviors
+- Not a general IME framework — no plugin system, no other Vietnamese input
+  styles (VNI, VIQR) yet.
+- Not cross-platform — Wayland only, no X11/XWayland support (XWayland apps
+  do not get transformed text since they don't speak text-input-v3).
+- Not a configuration system — behavior is currently compiled in, no config
+  file.
 
-| Behavior | Detail |
-|----------|--------|
-| Toggle VN | Press and release **Ctrl+Shift** with no other key in the chord. |
-| Toggle preedit | **Ctrl+Shift+Space** switches direct-commit ↔ preedit mode (direct default). |
-| Passthrough | When VN off, or app inactive, or Ctrl/Alt/Super held → key forwarded as-is. |
-| Composition | Letters fed to Bamboo engine; result applied as minimal byte diff. |
-| Backspace | If composing a word, edits the word; otherwise forwarded to app. |
-| Caps/Shift | Uppercases letters before feeding the engine (`shift XOR capsLock`). |
-| No-IM safety | `run.sh` stops the installed gokey before a dev build, relaunches it on exit. |
+## Key behaviors
 
-## Requirements
+| Behavior | Trigger | Result |
+|---|---|---|
+| Toggle Vietnamese on/off | Ctrl+Shift pressed and released together, no other key in between | `vnOn` flips; in-progress word ends; log line `Vietnamese=<bool>` |
+| Toggle composition mode | Ctrl+Shift+Space | `preedit` flips between direct-commit (default) and preedit; in-progress word is flushed first |
+| Compose a word (direct mode) | Any letter key while Vietnamese is on and a text-input client is focused | Bamboo processes the key; gokey deletes the trailing characters that changed and commits the new ones via `commit_string` |
+| Compose a word (preedit mode) | Same, but `preedit == true` | The whole in-progress word is shown via `set_preedit_string`, replacing itself atomically each keystroke |
+| End a word | Space, punctuation, Enter, or a Ctrl/Alt/Super chord | Direct mode: engine resets (text already committed). Preedit mode: pending preedit is committed as real text, then reset |
+| Arm Backspace-restore | Word ended by exactly one Space (direct mode only, word was non-empty) | Raw keystrokes and on-screen form of the just-ended word are stashed |
+| Backspace-restore fires | Backspace immediately after an arming Space, nothing else typed since | The space is deleted with one synthetic Backspace, the stashed word is replayed into a fresh engine, and composition continues (e.g. `vi` + Space + Backspace + `f` → `vì`) |
+| Backspace-restore refused | Stashed raw keys don't replay to the exact on-screen word (e.g. after an in-word Backspace following a tone-cancel pair) | Restore is skipped, engine stays empty, Backspace behaves like a normal forwarded key |
+| Pass through when inactive | Focused client has no text-input (drun launchers, overlays) or Vietnamese is off | Every key is forwarded raw via the virtual keyboard, nothing is consumed |
+| Pass through modifiers/chords | Ctrl, Alt, Super held with another key | Key is forwarded; if a word was in progress it is ended first |
 
-**Runtime:**
-- A Wayland compositor exposing `zwp_input_method_manager_v2` **and**
-  `zwp_virtual_keyboard_manager_v1` (e.g. Sway, Hyprland, river, KWin with the protocol).
-- No other input method holding the `input-method-v2` slot on the seat.
+## Users / audience
 
-**Build:**
-- Go 1.25+ (`go build -o gokey .`).
+Linux desktop users on a Wayland compositor with input-method-v2 support
+(currently verified on Hyprland) who type Vietnamese and want a lightweight
+alternative to ibus-bamboo/fcitx5-bamboo without pulling in a full input
+framework.
 
-## Environment Variables
+## Success criteria
 
-| Var | Effect |
-|-----|--------|
-| `GOKEY_DEBUG` | When non-empty, enables verbose `log.Printf` tracing of activate/key/diff events. |
+- `go test ./engine` passes (Telex transform correctness, including the
+  Backspace-restore replay/refusal cases).
+- Typing `tieesng vieejt` into a `text-input-v3` terminal (e.g. `foot`)
+  produces `tiếng việt`.
+- A launcher (wofi/fuzzel) receives every keystroke unmodified while
+  unfocused by gokey's grabbed input method.
+- Only one gokey process holds the input-method seat grab at a time; a
+  second instance fails fast with a clear log message instead of silently
+  fighting the first.
 
-## Status
+## Current status
 
-Working prototype. Core Telex path, toggle, backspace, and passthrough implemented and
-unit-tested (`engine/telex_test.go`). Generated Wayland bindings carry a manual patch
-(see Code Standards) that must be re-applied if regenerated.
+All goals above are implemented and covered by the engine test suite (see
+`docs/codebase-summary.md` for the exact test list). The project is in active
+use as the author's daily-driver IME on a single Hyprland machine (see
+`docs/deployment-guide.md`); it has not been packaged or tested on other
+compositors.

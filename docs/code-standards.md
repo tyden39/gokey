@@ -1,81 +1,108 @@
-# gokey — Code Standards & Conventions
+# gokey — Code Standards
 
-## Language & Tooling
+## Module boundaries
 
-- **Go 1.25** (`go.mod`). Standard `gofmt` formatting (tabs, standard import grouping).
-- Build: `go build -o gokey .`  •  Test: `go test ./...`  •  Vet: `go vet ./...`.
-- No linter config committed; keep code `gofmt`-clean and `go vet`-clean.
+- **`engine/`** contains only pure Telex logic. It imports `bamboo-core` and
+  nothing else — no Wayland types, no `log`, no `os`. This keeps it testable
+  with plain `go test` and reusable if gokey ever needs a second frontend.
+  If you're fixing a Telex correctness bug (wrong tone, wrong diacritic,
+  wrong word boundary), the fix belongs here, not in `main.go`.
+- **`main.go`** contains all Wayland glue and text-injection logic: connecting
+  to the compositor, binding globals, the key-event state machine, and both
+  inject paths (`apply`/`sendBackspace` for direct mode, `setPreedit`/
+  `flushPreedit` for preedit mode). Real-world bugs — a key that gets
+  swallowed, a race between deleting and inserting, a launcher that stops
+  responding — are almost always here.
+- **`internal/inputmethod/`, `internal/virtualkeyboard/`** are generated
+  Wayland protocol bindings produced by `go-wayland-scanner` from
+  `protocols/*.xml`. Do not hand-edit these except for the one documented
+  patch (see "Generated code" below). If the protocol XML changes, regenerate
+  and re-apply the patch rather than hand-patching the diff.
+- **`internal/keymap/`** is small and hand-written (not generated): evdev
+  keycode constants and the US-layout letter map. Fine to edit directly.
 
-## Project Structure Conventions
+## Generated code
 
-- `main` package at repo root (the Wayland app).
-- Reusable logic under `internal/` (not importable outside the module) and `engine/`.
-- One concern per package: `engine` (Telex), `keymap` (keycodes), `inputmethod` &
-  `virtualkeyboard` (protocol bindings).
-- Files are small and focused; hand-written files stay well under 300 LOC.
+`internal/inputmethod/input_method.go` carries one manual patch on top of
+whatever `go-wayland-scanner` produces: the `CommitString` and
+`SetPreeditString` methods call `client.PutString` with `len(text)+1` instead
+of the scanner's default length, because the generator mis-sizes the padded
+wire buffer for strings whose byte length is not a multiple of 4. This is
+called out in a `NOTE:` comment directly above the affected code (around line
+36 of that file). If these bindings are ever regenerated from
+`protocols/input-method-unstable-v2.xml`, re-apply this fix before shipping —
+without it, some committed strings will have their length field wrong on the
+wire.
 
-## Naming
+## Naming and formatting
 
-- Packages: short lowercase (`engine`, `keymap`, `inputmethod`, `virtualkeyboard`).
-- Exported identifiers documented with a leading doc comment in the Go style
-  (`// Telex wraps …`). Keep comments explaining *why*, not just *what*.
-- evdev key constants prefixed `Key…` (`KeyBackspace`, `KeyLeftShift`).
+- Standard Go conventions: exported identifiers in `CamelCase`, unexported in
+  `camelCase`, file names in `snake_case.go`.
+- Format with `gofmt` (or `go fmt ./...`) before committing; there is no
+  separate lint config or CI pipeline in this repo — `gofmt` plus `go vet`
+  are the baseline.
+- Wayland-protocol-derived names (`ZwpInputMethodV2`, `zwp_virtual_keyboard_v1`,
+  evdev key constants like `KeyBackspace`) keep the protocol's own casing —
+  don't rename them to look more Go-idiomatic, since they need to map back to
+  the XML/evdev headers for anyone cross-referencing the spec.
 
-## Generated Code Rules (IMPORTANT)
+## Comments
 
-`internal/inputmethod/input_method.go` and `internal/virtualkeyboard/virtual_keyboard.go`
-are produced by `go-wayland-scanner` from `protocols/*.xml`. Treat them as vendored:
+Comments in this codebase explain **invariants and non-obvious reasoning**,
+not narration of what the next line does. Examples already in the code that
+set the pattern to follow:
 
-- Prefer changing the XML + regenerating over hand-editing, **except** for the documented patch below.
-- **Manual patch (must survive regeneration):** in `input_method.go`, `PutString` calls pass
-  `len(text)+1` as the wire string-length prefix instead of go-wayland's padded length.
-  go-wayland wrote the *padded* length, producing malformed `commit_string` /
-  `set_preedit_string` messages for strings whose byte length isn't 4-aligned. See the
-  `NOTE:` block at the top of the file. Re-apply after any regeneration.
+- `apply()`'s doc-comment explains *why* fake Backspace is used instead of
+  `delete_surrounding_text` (works in terminals too), not just what the
+  function does.
+- The `restoreRaw`/`restoreWord` field comment in the `app` struct explains
+  the one-shot arming rule and which mode it applies to, because that's not
+  derivable just from the field's type.
+- The comment before `restoreRaw, restoreWord := a.restoreRaw, ...` at the
+  top of `onKey` explains that restore is deliberately one-shot and why
+  every other key invalidates it.
 
-## Wayland / Encoding Invariants
+When adding a similar piece of state or a non-obvious inject decision, write
+the comment as "why this and not the obvious alternative," matching that
+existing tone. Avoid comments that just restate the code (e.g. `// increment
+counter` above `i++`).
 
-- **`delete_surrounding_text` counts UTF-8 bytes, not runes.** All diff math in
-  `engine/telex.go` returns byte counts; callers must not pass rune counts.
-- **Commit atomically.** Patch a word with one `delete_surrounding_text` + `commit_string`
-  + `commit(serial)` sequence. Do **not** emit real Backspace key events to edit composed
-  text — Chrome autocomplete reacts to intermediate edits and breaks sequences like
-  `dd` → `đ` (see comment on `app.apply` in `main.go`).
-- **`serial`** passed to `Commit` must equal the number of `done` events received; it is
-  incremented in the done handler.
-- **Close keymap fds.** After forwarding a keymap fd to the virtual keyboard, close it
-  (`unix.Close`) to avoid fd leaks.
+## Testing
 
-## Input-Handling Conventions
+- Engine logic (`engine/telex.go`) must have `go test ./engine` coverage for
+  any new behavior — it's cheap to test since it has no Wayland dependency.
+  Follow the existing pattern in `engine/telex_test.go`: build a `*Telex`,
+  feed it a sequence of runes through `ProcessChar`, apply the returned
+  diffs to a local `[]rune` buffer the way the frontend would, and assert on
+  the final string. See `applyAll` and `feedTracked` for the two existing
+  helpers.
+- `main.go` has no automated tests; it's verified manually against a live
+  compositor (see `docs/deployment-guide.md` for the smoke test). Keep
+  Wayland-dependent logic thin enough that most real behavior can still be
+  exercised through `engine` tests — e.g. `apply()`'s diff-application logic
+  is intentionally mirrored by `engine`'s own diff tests rather than needing
+  a live Wayland harness.
 
-- Pair key press/release via the `consumed` map: if a press was swallowed by gokey, swallow
-  its release too; otherwise forward both.
-- Passthrough rule: when `!active || !vnOn || ctrl || alt || super`, forward the key and
-  `Reset()` the engine (modifiers/inactivity end the current word).
-- Word-breaking keys (space, punctuation, enter, unknown) `Reset()` the engine before forwarding.
+## Commits
 
-## Error Handling
+Conventional commit format (`feat:`, `fix:`, `docs:`, `refactor:`, etc.), no
+AI-authorship references in commit messages, matching this repo's existing
+history.
 
-- Startup/setup failures use `log.Fatalf` (unrecoverable: no compositor support, grab
-  failure, another IM active). This is intentional for a single-purpose daemon.
-- Per-request errors from protocol writes are generally ignored in the hot path (best-effort
-  forwarding); guard with `keymapSet` / nil checks before using `vk`.
+## Design conventions worth preserving
 
-## Debugging
-
-- Gate verbose logging behind `GOKEY_DEBUG` via the `dbg(...)` helper — no unconditional
-  trace logging in the key path.
-
-## Testing Conventions
-
-- Engine logic is unit-tested in `engine/telex_test.go` using table-driven cases and an
-  `applyAll` helper that simulates the app's text buffer by applying byte diffs.
-- Wayland-bound code (`main.go`) is validated by manual smoke test (see Codebase Summary),
-  not unit tests.
-
-## Comments & Naming Hygiene
-
-- Comments explain invariants and rationale (byte-vs-rune, Chrome autocomplete, serial
-  semantics). Keep them when refactoring.
-- Do not reference plan/phase/finding artifacts in code comments or filenames — explain the
-  reason itself, not its origin.
+- **Direct mode stays the default.** Preedit mode is an intentional opt-in
+  (`Ctrl+Shift+Space`) because it trades a terminal-compatibility problem
+  (fake-Backspace races) for a different one (some terminals don't render
+  `set_preedit_string` at all). Don't flip the default without discussing the
+  tradeoff — it was a deliberate user-facing choice, not an oversight.
+- **Only one text-inject path per mode.** `apply()` in direct mode and
+  `setPreedit`/`flushPreedit` in preedit mode are each meant to be the single
+  way text reaches the focused app in that mode. Don't add a second
+  conditional path (e.g. surrounding-text delete for some clients) without
+  updating `docs/system-architecture.md` and `docs/project-roadmap.md`,
+  since the current single-path design is what avoids ordering races.
+- **Gate all Vietnamese-relevant handling on `a.active`.** Any new key
+  handling added to `onKey` must still forward raw keys when `!a.active`
+  (launchers, overlays) — this is the difference between an IME that plays
+  nicely with the rest of the desktop and one that breaks app launchers.

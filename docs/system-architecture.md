@@ -1,100 +1,221 @@
 # gokey — System Architecture
 
-## High-Level Flow
-
-```
-Hardware keyboard
-      │  (compositor routes all keys to the grab holder)
-      ▼
-┌─────────────────────────────────────────────────────────┐
-│ gokey process                                            │
-│                                                          │
-│  zwp_input_method_v2  ◄── grab keyboard ──┐              │
-│        │  key/modifier/keymap events       │             │
-│        ▼                                   │             │
-│   app.onKey (main.go)  ── decides ──►  Telex engine      │
-│        │                                   │  (bamboo)   │
-│        │  Vietnamese:                       ▼            │
-│        │    delete_surrounding_text + commit_string      │
-│        │  Passthrough:                                    │
-│        └──► zwp_virtual_keyboard_v1.key ─────────────────┤
-└─────────────────────────────────────────────────────────┘
-      │                                   │
-      ▼                                   ▼
- Focused text-input-v3 app          Focused app (raw key)
-```
-
-Two Wayland objects do the work:
-
-1. **`zwp_input_method_v2`** (+ its keyboard grab): receives every key, and is used to
-   *commit* transformed Vietnamese text to the focused application.
-2. **`zwp_virtual_keyboard_v1`**: re-injects keys that should pass through unchanged
-   (modifiers, non-letters, keys typed while VN is off or a non-shift modifier is held).
-   The grabbed keymap is forwarded to the virtual keyboard so injected keycodes map
-   correctly.
-
 ## Components
 
-| Component | File | Responsibility |
-|-----------|------|----------------|
-| App / event loop | `main.go` | Wayland connect, registry bind, grab setup, key/modifier dispatch, toggle logic. |
-| Telex engine wrapper | `engine/telex.go` | Wrap bamboo-core; produce `(deleteBytes, insert)` diffs; track displayed word. |
-| Keymap | `internal/keymap/keymap.go` | evdev keycode → US lowercase letter; modifier/backspace constants. |
-| input-method bindings | `internal/inputmethod/input_method.go` | Generated `zwp_input_method_*` protocol client (manually patched). |
-| virtual-keyboard bindings | `internal/virtualkeyboard/virtual_keyboard.go` | Generated `zwp_virtual_keyboard_*` protocol client. |
-| Protocol XML | `protocols/*.xml` | Source specs the Go bindings were generated from. |
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Wayland compositor (Hyprland / Sway / river)                    │
+│                                                                   │
+│   physical keyboard                                              │
+│         │                                                        │
+│         ▼                                                        │
+│   zwp_input_method_v2  ───────grab_keyboard───────►  gokey        │
+│   (compositor routes ALL key events to the grabbing IM           │
+│    while it holds the seat's input-method slot)                  │
+│                                                                   │
+│   zwp_virtual_keyboard_v1  ◄──synthetic key events────  gokey     │
+│   (compositor re-delivers these to the focused client            │
+│    exactly like real keyboard input)                             │
+│                                                                   │
+│   focused text-input-v3 client (terminal, GTK/Qt app, browser)   │
+│         ▲                                                        │
+│         └── commit_string / set_preedit_string (via im object)   │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-## Key Decision: No Preedit, Diff-Based Commit
+gokey is a single Go process (`main.go`) built around one `app` struct. It
+opens one Wayland connection, binds three globals (`wl_seat`,
+`zwp_input_method_manager_v2`, `zwp_virtual_keyboard_manager_v1`), creates
+one input method + grab and one virtual keyboard, and then runs an event
+loop (`a.ctx.Dispatch()`) forever.
 
-`gokey` does **not** use `set_preedit_string`. Instead each keystroke recomputes the full
-Vietnamese word from the engine and applies the minimal change to already-committed text:
+Inside the process, key handling is split into two layers:
 
-- `engine.Telex` keeps `displayed` = what the app currently shows for the in-progress word.
-- After feeding a key, it computes the longest common rune prefix between `displayed` and
-  the new word, then returns:
-  - `deleteBytes` = trailing UTF-8 bytes of the old word to remove
-    (Wayland `delete_surrounding_text` counts **bytes**, not runes),
-  - `insert` = the suffix to commit.
-- `app.apply` issues `DeleteSurroundingText` + `CommitString` + `Commit(serial)` as one
-  input-method commit.
+- **`engine/telex.go`** — pure Telex logic. Wraps a single
+  `bamboo.IEngine` instance and knows nothing about Wayland. Given a stream
+  of runes, it tracks what the composing word should currently look like
+  (`displayed`) and returns `(deleteRunes, insert)` diffs so the caller can
+  patch already-committed text with the minimum number of edits.
+- **`main.go`** — Wayland glue. Decides, per key event, whether the key is
+  Vietnamese-relevant (compose it via `engine`), a control chord (toggle
+  Vietnamese or preedit mode), or something to forward untouched (shortcuts,
+  navigation, punctuation once a word has ended, or anything typed while
+  Vietnamese is off or the client isn't focused for input).
 
-Rationale (see comment in `main.go:apply`): sending real Backspace key events to patch the
-word makes Chrome's autocomplete observe intermediate edits, breaking first-character Telex
-sequences like `dd` → `đ`. A single atomic IM commit avoids that.
+## Protocols used
 
-## Toggle State Machine (Ctrl+Shift)
+### `zwp_input_method_v2`
 
-Tracked in `app.updateModifier` (`main.go`):
+- gokey calls `GetInputMethod(seat)` once, then `GrabKeyboard()` to receive
+  every keyboard event that would otherwise go straight to the compositor's
+  normal input routing. While the grab is held, no other input method can
+  hold the same grab — the compositor sends the `unavailable` event to any
+  second grab attempt instead.
+- Events consumed: `keymap` (compositor's keyboard layout, forwarded to the
+  virtual keyboard so it stays in sync), `key` (every physical key
+  press/release), `modifiers` (forwarded to the virtual keyboard), `activate`
+  / `deactivate` (focus gained/lost — resets per-focus state), `done`
+  (increments the serial number used on `Commit()` calls), `unavailable`
+  (another input method already holds the grab — gokey logs and exits).
+- Requests used: `CommitString(text)` and `SetPreeditString(text,
+  cursorBegin, cursorEnd)` followed by `Commit(serial)` to atomically apply
+  them. `DeleteSurroundingText` is used on exactly one path — cursor-word
+  adoption (`adoptWord`), where it removes the adopted word atomically with
+  the replacement in the same `Commit`. Live typing never calls it — see
+  "Why not surrounding-text delete" below.
+- Events used for adoption: `surrounding_text` (text around the cursor with
+  byte offsets for cursor/anchor, double-buffered) is snapshotted and
+  promoted on the next `done`; a `done` without a fresh surrounding event
+  invalidates the snapshot, and `surrDirty` marks it stale whenever gokey
+  itself forwards a key press, fakes a Backspace, or commits text.
 
-- On first modifier press of a chord: reset `chordOther` and `sawCtrlShift`.
-- While both Ctrl and Shift are down: set `sawCtrlShift`.
-- Any non-modifier key during the chord sets `chordOther = true` (so Ctrl+Shift+C won't toggle).
-- When all modifiers release: if `sawCtrlShift && !chordOther`, flip `vnOn`.
+### `zwp_virtual_keyboard_v1`
 
-CapsLock is tracked as a latching boolean (toggles on press).
+- gokey creates exactly one virtual keyboard tied to the same seat.
+- `Keymap(format, fd, size)` is called once, as soon as the input method's
+  own `keymap` event arrives, so the virtual keyboard's layout matches what
+  the compositor expects. Nothing can be forwarded or faked until this
+  succeeds (`keymapSet` guards `forward()` and `sendBackspace()`).
+- `Modifiers(...)` mirrors every modifier state change from the input method
+  grab so the focused client sees consistent modifier state even though the
+  physical keyboard is grabbed.
+- `Key(time, key, state)` is used two ways: **forwarding** — replaying a
+  physical key event byte-for-byte when it doesn't need Vietnamese
+  transformation — and **faking Backspace** — sending a synthetic
+  press+release pair (`sendBackspace()`) to delete one character of
+  already-committed text, using an internal monotonically increasing
+  `vkTime` counter since there's no real hardware timestamp for a synthetic
+  event.
 
-## Event Handling Detail (`app.onKey`)
+## Event flow
 
-1. Modifier key → update state, forward, return.
-2. Key release → if the press was consumed by gokey, swallow the release; else forward.
-3. If inactive / VN off / Ctrl|Alt|Super held → reset engine, forward (passthrough).
-4. Backspace → ask engine; if composing, apply diff and consume; else forward.
-5. Letter key → uppercase if needed, feed engine, apply diff, consume.
-6. Any other key (space, punctuation, enter) → reset engine (ends the word), forward.
+### Direct mode (default), composing a Vietnamese word
 
-`serial` increments on each input-method `done` event and is passed to `Commit`.
+1. Physical key press arrives as a `key` event on the input-method grab.
+2. `onKey` checks it's a letter (`keymap.Letter`), applies shift/caps-lock to
+   get upper/lowercase, and calls `a.tx.ProcessChar(r)`.
+3. `engine.Telex.ProcessChar` feeds the rune into bamboo-core, gets back the
+   new full word, and diffs it against what's already displayed, returning
+   `(deleteRunes, insert)`.
+4. `a.apply(deleteRunes, insert)` sends `deleteRunes` synthetic Backspace
+   key events through the virtual keyboard (one rune per Backspace), then —
+   if `insert` is non-empty — calls `im.CommitString(insert)` followed by
+   `im.Commit(serial)`.
+5. The focused client sees: some Backspaces (deleting the stale suffix of
+   the word), then new committed text. Because there is only one inject
+   path, there's no race between two different mechanisms — every edit to
+   already-typed text goes through the same fake-Backspace-then-commit
+   sequence, whether the client is a terminal or a GUI text field.
 
-## External Dependencies
+### Word ends (Space / punctuation / Enter)
 
-| Dependency | Purpose |
-|------------|---------|
-| `github.com/BambooEngine/bamboo-core` | Telex → Vietnamese transformation engine. |
-| `github.com/rajveermalviya/go-wayland/wayland/client` | Wayland client runtime (Context, Display, Registry, Seat). |
-| `golang.org/x/sys/unix` | `unix.Close` for keymap fds. |
+1. `onKey` computes `arm := code == KeySpace && !preedit && !tx.Empty()` and
+   snapshots `tx.RawKeys()` and `tx.Current()` *before* ending the word.
+2. `endWord()` resets the engine (direct mode) or flushes the preedit text
+   (preedit mode).
+3. If `arm` was true, `restoreRaw`/`restoreWord` are set to the snapshot.
+4. The triggering key itself (Space/punctuation/Enter) is forwarded normally
+   — it was never Vietnamese-relevant.
 
-## Lifecycle
+### Backspace-restore (direct mode only)
 
-1. `client.Connect("")` → bind `wl_seat`, `input_method_manager_v2`, `virtual_keyboard_manager_v1`.
-2. `GetInputMethod` + `CreateVirtualKeyboard`; register activate/deactivate/done/unavailable handlers.
-3. `GrabKeyboard`; register keymap/modifiers/key handlers.
-4. Loop on `ctx.Dispatch()` forever. Fatal-logs on protocol error or missing globals.
+This is a same-week feature: ending a word with a single Space stashes it so
+the very next Backspace can un-end it, letting tone keys keep editing a word
+that already looks "finished" on screen — e.g. `vi` + Space + Backspace +
+`f` → `vì`.
+
+1. Every key press first disarms the stash unconditionally
+   (`restoreRaw, restoreWord := a.restoreRaw, a.restoreWord; a.restoreRaw, a.restoreWord = "", ""`)
+   — restore is one-shot, so only the key press immediately following the
+   arming Space can use the snapshot taken from local variables.
+2. If the key is Backspace and the engine currently has nothing composing
+   (`tx.Backspace()` returned `handled == false`) and a stash exists,
+   `tx.RestoreWord(restoreRaw, restoreWord)` is tried.
+3. `RestoreWord` resets the engine, replays `restoreRaw` through bamboo in
+   Vietnamese mode, and compares the result to `restoreWord`. If they match,
+   the word is composing again and the method returns `true`; if not (see
+   the tone-cancel edge case in `docs/codebase-summary.md`), it returns
+   `false` and the Backspace falls through to being forwarded like normal.
+4. On success, gokey calls `sendBackspace()` once (a synthetic press+release,
+   not a forward of the physical key) to delete the space character in the
+   app, and marks the physical Backspace's keycode in `consumed` so its
+   matching key-release event is swallowed instead of forwarded. Consuming
+   the physical press (rather than forwarding it) matters because letting
+   the client auto-repeat a forwarded physical Backspace could delete
+   further into the just-restored word before gokey regains control.
+5. Subsequent keys (e.g. `f` for a tone) go through the normal `ProcessChar`
+   → `apply` path, editing the now-restored word.
+
+### Preedit mode (opt-in, Ctrl+Shift+Space)
+
+1. Each letter still goes through `tx.ProcessChar`, but instead of `apply`,
+   `setPreedit(tx.Current())` is called: `im.SetPreeditString(word,
+   len(word), len(word))` followed by `Commit(serial)`. The compositor
+   replaces the entire preedit string atomically each time, so there's no
+   fake-Backspace sequence and no ordering race — but preedit rendering is a
+   client responsibility, and terminal emulators commonly don't render
+   `set_preedit_string` at all, which is why direct mode is the default.
+2. Word end calls `flushPreedit()`: clears the preedit
+   (`SetPreeditString("", 0, 0)`), commits the finished word as real text via
+   `CommitString`, then resets the engine.
+3. Backspace-restore is not armed in preedit mode (`arm` requires
+   `!a.preedit`) since the word was never committed as discrete diffable
+   text.
+
+### Toggling
+
+- **Ctrl+Shift (Vietnamese on/off):** `updateModifier` tracks whether
+  Ctrl+Shift were both held during a modifier chord (`sawCtrlShift`) and
+  whether any other key was pressed during it (`chordOther`, set by every
+  non-modifier key press). When the chord fully releases
+  (`wasAny && !nowAny`), if `sawCtrlShift && !chordOther`, `vnOn` flips, the
+  current word ends, and the restore stash is cleared.
+- **Ctrl+Shift+Space (preedit mode on/off):** checked directly in `onKey`
+  before the general Ctrl/Alt/Super passthrough branch — it flushes the
+  current word via `endWord()`, then flips `preedit`, and consumes the Space
+  key press so it doesn't also get typed as a literal space.
+
+### Passthrough (inactive client, Vietnamese off, or modifier chords)
+
+If `!a.active` (no text-input focus — e.g. a drun launcher like wofi/fuzzel,
+or a layer-shell overlay), or `!a.vnOn`, or a Ctrl/Alt/Super modifier is held,
+`onKey` calls `a.forward(e)` to replay the key through the virtual keyboard
+unchanged, ending any in-progress word first if a modifier chord was
+involved. This is what keeps launchers usable: they never get `text-input`
+focus from gokey's point of view, so every key — including letters that
+would otherwise be Vietnamese-composed — passes straight through. `forward`
+(and `sendBackspace`) silently do nothing if `keymapSet` is still false,
+which is the usual cause of "gokey is running but nothing types."
+
+## Why not surrounding-text delete
+
+`zwp_input_method_v2::delete_surrounding_text` exists specifically to let an
+input method delete part of the text around the cursor without needing fake
+key presses. gokey uses it only for cursor-word adoption (`adoptWord`);
+for live typing, `apply()` in `main.go` has exactly one inject path — fake
+Backspace key events through the virtual keyboard, followed by
+`commit_string`. This is documented in the
+`apply()` doc-comment in `main.go` as intentional: fake Backspace works in
+every application, including terminal emulators, which generally do not
+implement the `zwp_input_method_v2::surrounding_text` event needed to make
+`delete_surrounding_text` usable at all. Using surrounding-text deletion for
+GUI clients and fake Backspace for terminals would mean two different inject
+paths to keep correct, and is called out in `docs/project-roadmap.md` as a
+candidate future improvement rather than a rejected idea — see that
+document for the tradeoff it would address (a known race in some GUI
+clients between a fake Backspace and their own text-input state).
+
+## Process lifecycle
+
+- `main()` connects to the compositor, binds globals via the registry's
+  global handler, then blocks on a Wayland roundtrip (`a.roundtrip()`) so all
+  three globals (`seat`, `imMgr`, `vkMgr`) are guaranteed bound before setup
+  continues. Missing any of them is a fatal error — the compositor doesn't
+  support input-method-v2 or virtual-keyboard-v1.
+- `setup()` creates the input method, the virtual keyboard, registers all
+  event handlers, and grabs the keyboard. If another process already holds
+  the grab, the compositor's `unavailable` event fires and gokey logs a
+  message naming the likely cause (another input method, e.g. fcitx5) and
+  exits via `log.Fatal`.
+- The main loop is a bare `for { a.ctx.Dispatch() }` — gokey is entirely
+  event-driven; there is no polling, timer, or background goroutine.
