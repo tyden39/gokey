@@ -7,8 +7,8 @@ single binary with no daemon framework (no IBus, no fcitx5). It speaks two
 standard Wayland protocols directly:
 
 - `zwp_input_method_v2` — grabs the keyboard, receives raw key/modifier
-  events, and commits transformed text (`commit_string`) or shows in-progress
-  text (`set_preedit_string`) to the focused application.
+  events, and commits transformed text (`commit_string`) to the focused
+  application.
 - `zwp_virtual_keyboard_v1` — forwards keys the input method doesn't need to
   transform (shortcuts, punctuation, navigation) and sends synthetic
   Backspace key events to erase already-committed characters so they can be
@@ -47,21 +47,18 @@ Sway, river) and needs nothing else installed.
   styles (VNI, VIQR) yet.
 - Not cross-platform — Wayland only, no X11/XWayland support (XWayland apps
   do not get transformed text since they don't speak text-input-v3).
-- Not a configuration system — behavior is currently compiled in, no config
-  file.
+- Not a general preferences system — the runtime JSON only maps app identity
+  to an injection strategy; keybindings and Vietnamese-on-by-default remain
+  compiled in.
 
 ## Key behaviors
 
 | Behavior | Trigger | Result |
 |---|---|---|
 | Toggle Vietnamese on/off | Ctrl+Shift pressed and released together, no other key in between | `vnOn` flips; in-progress word ends; log line `Vietnamese=<bool>` |
-| Toggle composition mode | Ctrl+Shift+Space | `preedit` flips between direct-commit (default) and preedit; in-progress word is flushed first |
-| Compose a word (direct mode) | Any letter key while Vietnamese is on and a text-input client is focused | Bamboo processes the key; gokey deletes the trailing characters that changed and commits the new ones via `commit_string` |
-| Compose a word (preedit mode) | Same, but `preedit == true` | The whole in-progress word is shown via `set_preedit_string`, replacing itself atomically each keystroke |
-| End a word | Space, punctuation, Enter, or a Ctrl/Alt/Super chord | Direct mode: engine resets (text already committed). Preedit mode: pending preedit is committed as real text, then reset |
-| Arm Backspace-restore | Word ended by exactly one Space (direct mode only, word was non-empty) | Raw keystrokes and on-screen form of the just-ended word are stashed |
-| Backspace-restore fires | Backspace immediately after an arming Space, nothing else typed since | The space is deleted with one synthetic Backspace, the stashed word is replayed into a fresh engine, and composition continues (e.g. `vi` + Space + Backspace + `f` → `vì`) |
-| Backspace-restore refused | Stashed raw keys don't replay to the exact on-screen word (e.g. after an in-word Backspace following a tone-cancel pair) | Restore is skipped, engine stays empty, Backspace behaves like a normal forwarded key |
+| Compose a word | Any letter key while Vietnamese is on and a text-input client is focused | Bamboo returns a rune diff; GoKey uses the app's configured injection strategy, falling back to virtual Backspace whenever surrounding text is unsafe |
+| Select Chromium strategy | Input-method focus activates in a Hyprland window whose `initialClass` is `chromium` | Cache the identity and select atomic `delete_surrounding_text` + `commit_string`; do not poll per key |
+| End a word | Space, punctuation, Enter, or a Ctrl/Alt/Super chord | The engine resets because the transformed text is already committed |
 | Pass through when inactive | Focused client has no text-input (drun launchers, overlays) or Vietnamese is off | Every key is forwarded raw via the virtual keyboard, nothing is consumed |
 | Pass through modifiers/chords | Ctrl, Alt, Super held with another key | Key is forwarded; if a word was in progress it is ended first |
 
@@ -74,8 +71,8 @@ framework.
 
 ## Success criteria
 
-- `go test ./engine` passes (Telex transform correctness, including the
-  Backspace-restore replay/refusal cases).
+- `go test ./...` passes for Telex, configuration, Hyprland IPC parsing, UTF-8
+  deletion, and surrounding-state refusal cases.
 - Typing `tieesng vieejt` into a `text-input-v3` terminal (e.g. `foot`)
   produces `tiếng việt`.
 - A launcher (wofi/fuzzel) receives every keystroke unmodified while
@@ -86,8 +83,8 @@ framework.
 
 ## Current status
 
-All goals above are implemented and covered by the engine test suite (see
-`docs/codebase-summary.md` for the exact test list). The project is in active
-use as the author's daily-driver IME on a single Hyprland machine (see
-`docs/deployment-guide.md`); it has not been packaged or tested on other
+All goals above are implemented and covered by the engine, config, IPC, and
+snapshot-safety test suites (see `docs/codebase-summary.md`). The project is
+in active use as the author's daily-driver IME on a single Hyprland machine
+(see `docs/deployment-guide.md`); it has not been packaged or tested on other
 compositors.

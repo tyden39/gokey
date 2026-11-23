@@ -11,32 +11,23 @@ transformed Vietnamese text directly.
 
 - **Telex** composition via [BambooEngine/bamboo-core](https://github.com/BambooEngine/bamboo-core)
   (tones, diacritics, `đ`, uppercase).
-- **Direct mode by default** — commits text and patches it in place with fake Backspace
-  key events + `commit_string` diffs, which works in terminals as well as GUI apps (no
-  `delete_surrounding_text`, which most terminals don't support anyway).
-- **Preedit mode (opt-in)** — toggle with **Ctrl+Shift+Space** to show the in-progress
-  word via `set_preedit_string` instead; better for some GUI fields, but many terminals
-  won't render it, which is why direct mode is the default.
+- **App-aware direct composition** — terminals and unknown apps use fake Backspace
+  events + `commit_string`; configured apps such as Chromium use atomic
+  `delete_surrounding_text` + `commit_string` when their surrounding-text snapshot is
+  fresh and exact, with automatic fallback to fake Backspace otherwise.
 - **Toggle Vietnamese with Ctrl+Shift.**
-- **Backspace-restore** — end a word with one Space, then hit Backspace once to resume
-  composing it (tone keys keep working): `vi` + Space + Backspace + `f` → `vì`. Direct
-  mode only, one-shot (any other key disarms it).
-- **Cursor-word editing** — click inside or right after an already-typed word and press a
-  tone/mark key (`s f r x j w z`) to edit it: cursor after `chao` + `f` → `chào`. Works in
-  both modes, but only in apps that report surrounding text (most GUI apps; terminals
-  can't). The edit applies to the whole word and leaves the cursor at its end. Words that
-  wouldn't become valid Vietnamese are left untouched (`hello` + `s` just types `s`),
-  but short English words that are also valid Vietnamese syllables do get edited
-  (`cat` + `s` → `cát`) — same as what live typing would produce.
 - Passes through all non-Vietnamese keys (shortcuts, modifiers, punctuation) unchanged via
   `zwp_virtual_keyboard_v1`, and forwards everything untouched when the focused window
   isn't a text-input client (e.g. app launchers like wofi/fuzzel).
-- Tiny: ~410 lines of hand-written Go in `main.go`, plus a ~100-line engine wrapper.
+- Small, focused codebase with Wayland handling in `main.go` and pure Telex
+  logic under `engine/`.
 
 ## Requirements
 
 - Linux + a **Wayland compositor** exposing both `zwp_input_method_manager_v2` and
   `zwp_virtual_keyboard_manager_v1` (e.g. Sway, Hyprland, river).
+- **Hyprland** is required for app-specific strategy selection. On another compositor,
+  active-app detection fails open and the default fake-Backspace strategy still runs.
 - **Go 1.25+** to build.
 - No other input method holding the seat's input-method slot (`run.sh` stops the
   installed/autostarted gokey for you before running a dev build).
@@ -45,7 +36,7 @@ transformed Vietnamese text directly.
 
 ```bash
 go build -o gokey .          # build
-go test ./engine             # run engine unit tests (Telex transform)
+go test ./...                # run all unit tests
 ./run.sh                     # build + run (stops installed gokey, relaunches on exit, debug on)
 ```
 
@@ -58,9 +49,25 @@ GOKEY_DEBUG=1 ./gokey         # GOKEY_DEBUG enables verbose tracing
 ### Usage
 
 - **Ctrl+Shift** — toggle Vietnamese transform on/off.
-- **Ctrl+Shift+Space** — toggle direct-commit mode ↔ preedit mode (direct is the default).
-- Typing a word, ending it with Space, then pressing Backspace once resumes composing that
-  word instead of leaving tone keys to type plain letters.
+
+### Per-app typing strategy
+
+GoKey reads `~/.config/gokey/app-strategies.json` once at startup. The installed
+configuration maps Chromium's Hyprland `initialClass` to the atomic strategy:
+
+```json
+{
+  "default": "virtual-backspace-commit",
+  "apps": {
+    "chromium": "surrounding-delete-commit"
+  }
+}
+```
+
+Supported values are `virtual-backspace-commit` and
+`surrounding-delete-commit`. Restart GoKey after editing this file. Missing or invalid
+configuration, an unknown app, unavailable Hyprland IPC, or unsafe surrounding text all
+fall back to `virtual-backspace-commit`.
 
 ### Try it
 
@@ -77,9 +84,9 @@ Then type `tieesng vieejt` → `tiếng việt`. Press **Ctrl+Shift** to toggle 
 ```
 keyboard ──► zwp_input_method_v2 (grab) ──► gokey ──► Telex engine (bamboo)
                                               │
-     Direct mode:   fake Backspace (virtual keyboard) + commit_string ──► focused app
-     Preedit mode:  set_preedit_string, committed on word end ──────────► focused app
-     Passthrough:   zwp_virtual_keyboard_v1.key ───────────────────────► focused app
+     Default: fake Backspace (virtual keyboard) + commit_string ──────► focused app
+     Configured safe path: delete_surrounding_text + commit_string ──► focused app
+     Passthrough: zwp_virtual_keyboard_v1.key ───────────────────────► focused app
 ```
 
 Each keystroke recomputes the full Vietnamese word and applies the **minimal diff**
@@ -90,8 +97,10 @@ Each keystroke recomputes the full Vietnamese word and applies the **minimal dif
 
 | Path | What |
 |------|------|
-| `main.go` | Wayland app, key dispatch, Ctrl+Shift toggle logic. |
+| `main.go` | Wayland app, key dispatch, strategy selection, text injection. |
 | `engine/telex.go` | Bamboo engine wrapper + diff computation. |
+| `internal/appconfig/` | Runtime app-to-strategy JSON configuration. |
+| `internal/hyprland/` | Bounded active-window IPC query and cached app identity. |
 | `internal/keymap/` | evdev keycode → letter mapping, modifier constants. |
 | `internal/inputmethod/`, `internal/virtualkeyboard/` | Generated Wayland protocol bindings. |
 | `protocols/*.xml` | Source specs for the generated bindings. |
