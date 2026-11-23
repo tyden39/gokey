@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 restore() {
 	echo
 	echo "[run.sh] stopping dev gokey, relaunching installed instance..."
-	hyprctl dispatch exec '~/.local/bin/gokey' >/dev/null 2>&1 || true
+	hyprctl dispatch 'hl.dsp.exec_cmd("~/.local/bin/gokey")' >/dev/null 2>&1 || true
 }
 trap restore EXIT
 
@@ -20,8 +20,8 @@ echo "[run.sh] stopping installed gokey (only one input method can run at a time
 pkill -x gokey 2>/dev/null || true
 sleep 0.5
 
-echo "[run.sh] starting dev gokey. Toggle Vietnamese with Ctrl+Shift,"
-echo "[run.sh] toggle preedit mode with Ctrl+Shift+Space. Press Ctrl+C to quit."
+echo "[run.sh] starting dev gokey. Toggle Vietnamese with Ctrl+Shift."
+echo "[run.sh] Press Ctrl+C to quit."
 echo "[run.sh] In ANOTHER window, open a text-input-v3 app, e.g.:"
 echo "         env -u GTK_IM_MODULE -u QT_IM_MODULE -u XMODIFIERS foot"
 echo "         then type:  tieesng vieejt  ->  tiếng việt"

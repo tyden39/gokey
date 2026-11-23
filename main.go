@@ -4,12 +4,15 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/rajveermalviya/go-wayland/wayland/client"
 	"golang.org/x/sys/unix"
 
 	"gokey/engine"
+	"gokey/internal/appconfig"
+	"gokey/internal/hyprland"
 	"gokey/internal/inputmethod"
 	"gokey/internal/keymap"
 	"gokey/internal/virtualkeyboard"
@@ -17,12 +20,35 @@ import (
 
 const keyStatePressed = uint32(client.KeyboardKeyStatePressed)
 
+const activeWindowQueryTimeout = 100 * time.Millisecond
+
 var debug = os.Getenv("GOKEY_DEBUG") != ""
 
 func dbg(format string, args ...any) {
 	if debug {
 		log.Printf(format, args...)
 	}
+}
+
+// cursorContextRunes is how many runes of surrounding text are logged on each
+// side of the cursor.
+const cursorContextRunes = 20
+
+// cursorContext returns up to n runes before and after the byte offset cursor,
+// with "|" marking the cursor, for debug logging.
+func cursorContext(text string, cursor, n int) string {
+	if cursor < 0 || cursor > len(text) || !utf8.ValidString(text[:cursor]) {
+		return "<invalid cursor>"
+	}
+	before, after := []rune(text[:cursor]), []rune(text[cursor:])
+	prefix, suffix := "", ""
+	if len(before) > n {
+		before, prefix = before[len(before)-n:], "…"
+	}
+	if len(after) > n {
+		after, suffix = after[:n], "…"
+	}
+	return prefix + string(before) + "|" + string(after) + suffix
 }
 
 type app struct {
@@ -38,26 +64,19 @@ type app struct {
 	grab *inputmethod.ZwpInputMethodKeyboardGrabV2
 	vk   *virtualkeyboard.ZwpVirtualKeyboardV1
 
-	tx      *engine.Telex
-	serial  uint32
-	vnOn    bool
-	active  bool
-	preedit bool // false: commit live diff; true: show set_preedit_string
+	tx     *engine.Telex
+	serial uint32
+	vnOn   bool
+	active bool
 
-	// restoreRaw/restoreWord hold the raw keystrokes and on-screen form of
-	// the last word when it was ended by a single Space and nothing was typed
-	// since. Non-empty restoreRaw means the next Backspace deletes that space
-	// and resumes composing the word (so tone keys still edit it). Direct
-	// mode only.
-	restoreRaw  string
-	restoreWord string
+	strategies   appconfig.Config
+	activeWindow hyprland.ActiveWindow
 
 	// Surrounding-text snapshot from the focused client. The protocol
 	// double-buffers it: the event stores into surrPend*, and the next done
 	// event promotes it into surr*/surrValid. Clients that support it resend
 	// it with every state batch, so a done without a fresh event invalidates
-	// the snapshot rather than keeping a stale one. Terminals never send it,
-	// which is the feature gate for cursor-word adoption.
+	// the snapshot rather than keeping a stale one. Terminals never send it.
 	surrPendText   string
 	surrPendCursor int
 	surrPendAnchor int
@@ -66,10 +85,11 @@ type app struct {
 	surrCursor     int
 	surrAnchor     int
 	surrValid      bool
+	surrSerial     uint32
 	// surrDirty marks the snapshot stale: set whenever gokey itself changes
 	// the client's text or cursor (forwarded key press, fake Backspace,
 	// commit), cleared only when a fresh surrounding_text arrives with the
-	// next done. Blocks adoption from deleting at an offset the client has
+	// next done. Blocks surrounding deletes at an offset the client has
 	// already moved away from.
 	surrDirty bool
 
@@ -84,16 +104,18 @@ type app struct {
 }
 
 func main() {
+	strategies, strategyPath := loadStrategyConfig()
 	display, err := client.Connect("")
 	if err != nil {
 		log.Fatalf("connect wayland: %v", err)
 	}
 	a := &app{
-		ctx:      display.Context(),
-		display:  display,
-		tx:       engine.New(),
-		vnOn:     true,
-		consumed: map[uint32]bool{},
+		ctx:        display.Context(),
+		display:    display,
+		tx:         engine.New(),
+		vnOn:       true,
+		consumed:   map[uint32]bool{},
+		strategies: strategies,
 	}
 
 	display.SetErrorHandler(func(e client.DisplayErrorEvent) {
@@ -111,13 +133,32 @@ func main() {
 		log.Fatal("compositor missing input-method-v2 or virtual-keyboard-v1 support")
 	}
 	a.setup()
-	log.Printf("gokey running (Telex, Vietnamese=%v, toggle=Ctrl+Shift, preedit toggle=Ctrl+Shift+Space)", a.vnOn)
+	log.Printf("gokey running (Telex, Vietnamese=%v, toggle=Ctrl+Shift, app-strategies=%s)", a.vnOn, strategyPath)
 
 	for {
 		if err := a.ctx.Dispatch(); err != nil {
 			log.Fatalf("dispatch: %v", err)
 		}
 	}
+}
+
+func loadStrategyConfig() (appconfig.Config, string) {
+	config := appconfig.Defaults()
+	path, err := appconfig.DefaultPath()
+	if err != nil {
+		log.Printf("resolve app strategy config: %v; using %s", err, config.Default)
+		return config, "defaults"
+	}
+	loaded, err := appconfig.Load(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("load app strategy config %s: %v; using %s", path, err, config.Default)
+		} else {
+			dbg("app strategy config %s does not exist; using %s", path, config.Default)
+		}
+		return config, path
+	}
+	return loaded, path
 }
 
 func (a *app) roundtrip() {
@@ -171,17 +212,24 @@ func (a *app) setup() {
 		dbg("activate")
 		a.active = true
 		a.resetPerFocusState()
+		a.refreshActiveWindow()
 	})
 	im.SetDeactivateHandler(func(inputmethod.ZwpInputMethodV2DeactivateEvent) {
 		dbg("deactivate")
 		a.active = false
 		a.resetPerFocusState()
+		a.activeWindow = hyprland.ActiveWindow{}
 	})
 	im.SetSurroundingTextHandler(func(e inputmethod.ZwpInputMethodV2SurroundingTextEvent) {
 		a.surrPendText = strings.TrimRight(e.Text, "\x00")
 		a.surrPendCursor = int(e.Cursor)
 		a.surrPendAnchor = int(e.Anchor)
 		a.surrPending = true
+		dbg("surrounding cursor=%d anchor=%d around=%q", a.surrPendCursor, a.surrPendAnchor,
+			cursorContext(a.surrPendText, a.surrPendCursor, cursorContextRunes))
+		// The previous snapshot must not be used while a newer state batch is
+		// pending its done event and serial.
+		a.surrValid = false
 	})
 	im.SetDoneHandler(func(inputmethod.ZwpInputMethodV2DoneEvent) {
 		a.serial++
@@ -189,6 +237,7 @@ func (a *app) setup() {
 			a.surrText, a.surrCursor, a.surrAnchor = a.surrPendText, a.surrPendCursor, a.surrPendAnchor
 			a.surrValid = true
 			a.surrDirty = false
+			a.surrSerial = a.serial
 			a.surrPending = false
 			a.surrPendText, a.surrPendCursor, a.surrPendAnchor = "", 0, 0
 		} else {
@@ -250,17 +299,8 @@ func (a *app) onKey(e inputmethod.ZwpInputMethodKeyboardGrabV2KeyEvent) {
 
 	a.chordOther = true
 
-	// Restore is one-shot: only the very next key press after the arming
-	// Space may use it. Any other press — letters, punctuation, chords,
-	// a second Space — invalidates the stashed word.
-	restoreRaw, restoreWord := a.restoreRaw, a.restoreWord
-	a.restoreRaw, a.restoreWord = "", ""
-
-	// Ctrl+Shift+Space toggles between direct-commit and preedit modes.
-	if code == keymap.KeySpace && a.ctrl && a.shift && !a.alt && !a.super {
-		a.togglePreedit()
-		a.consumed[code] = true
-		return
+	if name, ok := keymap.CursorKeyName(code); ok {
+		dbg("cursor key %s (active=%v, word empty=%v)", name, a.active, a.tx.Empty())
 	}
 
 	if !a.active || !a.vnOn || a.ctrl || a.alt || a.super {
@@ -273,21 +313,9 @@ func (a *app) onKey(e inputmethod.ZwpInputMethodKeyboardGrabV2KeyEvent) {
 
 	if code == keymap.KeyBackspace {
 		dbg("backspace received (word empty=%v)", a.tx.Empty())
+		oldWord := a.tx.Current()
 		if del, ins, handled := a.tx.Backspace(); handled {
-			if a.preedit {
-				a.setPreedit(a.tx.Current())
-			} else {
-				a.apply(del, ins)
-			}
-			a.consumed[code] = true
-			return
-		}
-		if restoreRaw != "" && a.keymapSet && a.tx.RestoreWord(restoreRaw, restoreWord) {
-			// Delete the space with a synthetic press+release and consume the
-			// physical key: forwarding a bare press would let the client
-			// auto-repeat and eat into the word the engine just restored.
-			dbg("backspace restores word %q", restoreWord)
-			a.sendBackspace()
+			a.apply(oldWord, del, ins)
 			a.consumed[code] = true
 			return
 		}
@@ -299,196 +327,198 @@ func (a *app) onKey(e inputmethod.ZwpInputMethodKeyboardGrabV2KeyEvent) {
 		if a.shift != a.capsLock {
 			r = toUpper(r)
 		}
-		if a.tx.Empty() && isAdoptKey(r) && a.adoptWord(r) {
-			a.consumed[code] = true
-			return
-		}
+		oldWord := a.tx.Current()
 		del, ins := a.tx.ProcessChar(r)
 		dbg("letter %q -> delete %d, insert %q", r, del, ins)
-		if a.preedit {
-			a.setPreedit(a.tx.Current())
-		} else {
-			a.apply(del, ins)
-		}
+		a.apply(oldWord, del, ins)
 		a.consumed[code] = true
 		return
 	}
 
-	// A non-letter key (space, punctuation, Enter) ends the word. Space (in
-	// direct mode, with a word in progress) also arms Backspace-restore:
-	// stash the word's raw keys and on-screen form before the reset so one
-	// Backspace can bring it back for further tone edits.
-	arm := code == keymap.KeySpace && !a.preedit && !a.tx.Empty()
-	raw, word := a.tx.RawKeys(), a.tx.Current()
+	// A non-letter key (space, punctuation, Enter) ends the word.
 	a.endWord()
-	if arm {
-		a.restoreRaw, a.restoreWord = raw, word
-	}
 	a.forward(e)
 }
 
-// apply deletes deleteRunes trailing characters by sending real Backspace key
-// events through the virtual keyboard (works in every app, including
-// terminals, unlike delete_surrounding_text), then inserts text via the input
-// method's commit_string.
-func (a *app) apply(deleteRunes int, insert string) {
+// apply chooses the injection strategy for the cached active app. Unsafe or
+// stale surrounding-text state always falls back to virtual Backspace for the
+// current key rather than guessing at a cursor location.
+func (a *app) apply(oldWord string, deleteRunes int, insert string) {
+	if a.selectedStrategy() == appconfig.StrategySurroundingDeleteCommit {
+		if a.applySurroundingDeleteCommit(oldWord, deleteRunes, insert) {
+			return
+		}
+		dbg("surrounding delete refused for app=%q; falling back to sentinel Backspace", a.activeWindow.Identity())
+		a.applySentinelBackspaceCommit(deleteRunes, insert)
+		return
+	}
+	a.applyVirtualBackspaceCommit(deleteRunes, insert)
+}
+
+// applySentinelBackspaceCommit inserts a harmless sentinel before replacing
+// text. Some clients order a commit followed by virtual Backspace more
+// reliably when the cursor is first advanced by a committed character.
+func (a *app) applySentinelBackspaceCommit(deleteRunes int, insert string) {
+	a.surrDirty = true
+	if err := a.im.CommitString("."); err != nil {
+		dbg("commit sentinel: %v", err)
+	}
+	if err := a.im.Commit(a.serial); err != nil {
+		dbg("commit sentinel serial %d: %v", a.serial, err)
+	}
+
+	for i := 0; i < deleteRunes+1; i++ {
+		a.sendBackspace()
+	}
+	if insert != "" {
+		if err := a.im.CommitString(insert); err != nil {
+			dbg("commit string: %v", err)
+		}
+		if err := a.im.Commit(a.serial); err != nil {
+			dbg("commit serial %d: %v", a.serial, err)
+		}
+	}
+}
+
+func (a *app) applyVirtualBackspaceCommit(deleteRunes int, insert string) {
 	for i := 0; i < deleteRunes; i++ {
 		a.sendBackspace()
 	}
 	if insert != "" {
 		a.surrDirty = true
-		a.im.CommitString(insert)
-		a.im.Commit(a.serial)
-	}
-}
-
-// setPreedit shows the in-progress word as underlined preedit text instead of
-// committing it. The compositor replaces the whole preedit atomically each
-// time, so there are no fake Backspaces and no ordering race. Used only in
-// preedit mode. The cursor sits at the end of the word.
-func (a *app) setPreedit(word string) {
-	a.im.SetPreeditString(word, int32(len(word)), int32(len(word)))
-	a.im.Commit(a.serial)
-}
-
-// flushPreedit commits the current composing word as real text and clears the
-// preedit. Called when a word ends or when leaving preedit mode. No-op against
-// the application when not focused; the engine is reset either way.
-func (a *app) flushPreedit() {
-	if a.active {
-		word := a.tx.Current()
-		a.im.SetPreeditString("", 0, 0)
-		if word != "" {
-			a.surrDirty = true
-			a.im.CommitString(word)
+		if err := a.im.CommitString(insert); err != nil {
+			dbg("commit string: %v", err)
 		}
-		a.im.Commit(a.serial)
+		if err := a.im.Commit(a.serial); err != nil {
+			dbg("commit serial %d: %v", a.serial, err)
+		}
 	}
-	a.tx.Reset()
 }
 
-// endWord finishes the current word. In direct mode the text is already
-// committed live, so this only resets the engine; in preedit mode it commits
-// the pending preedit first.
+func (a *app) applySurroundingDeleteCommit(oldWord string, deleteRunes int, insert string) bool {
+	if deleteRunes == 0 {
+		if insert == "" {
+			return true
+		}
+		a.surrDirty = true
+		a.surrValid = false
+		if err := a.im.CommitString(insert); err != nil {
+			dbg("commit string: %v", err)
+		}
+		if err := a.im.Commit(a.serial); err != nil {
+			dbg("commit serial %d: %v", a.serial, err)
+		}
+		return true
+	}
+
+	deleteBytes, ok := surroundingDeleteBytes(
+		oldWord,
+		deleteRunes,
+		a.surrText,
+		a.surrCursor,
+		a.surrAnchor,
+		a.surrSerial,
+		a.serial,
+		a.surrValid,
+		a.surrDirty,
+	)
+	if !ok {
+		return false
+	}
+
+	a.surrDirty = true
+	a.surrValid = false
+	dbg(
+		"surrounding replace app=%q deleteBytes=%d insert=%q serial=%d",
+		a.activeWindow.Identity(),
+		deleteBytes,
+		insert,
+		a.serial,
+	)
+	if err := a.im.DeleteSurroundingText(deleteBytes, 0); err != nil {
+		dbg("delete %d surrounding bytes: %v", deleteBytes, err)
+	}
+	if insert != "" {
+		if err := a.im.CommitString(insert); err != nil {
+			dbg("commit string: %v", err)
+		}
+	}
+	if err := a.im.Commit(a.serial); err != nil {
+		dbg("commit serial %d: %v", a.serial, err)
+	}
+	return true
+}
+
+func (a *app) selectedStrategy() appconfig.Strategy {
+	return a.strategies.StrategyFor(a.activeWindow.Identity())
+}
+
+func (a *app) refreshActiveWindow() {
+	a.activeWindow = hyprland.ActiveWindow{}
+	window, err := hyprland.ActiveWindowFromEnvironment(activeWindowQueryTimeout)
+	if err != nil {
+		dbg("detect active Hyprland window: %v", err)
+		return
+	}
+	a.activeWindow = window
+	dbg(
+		"active app address=%s class=%q initialClass=%q pid=%d xwayland=%v strategy=%s",
+		window.Address,
+		window.Class,
+		window.InitialClass,
+		window.PID,
+		window.XWayland,
+		a.selectedStrategy(),
+	)
+}
+
+func surroundingDeleteBytes(
+	oldWord string,
+	deleteRunes int,
+	surrounding string,
+	cursor int,
+	anchor int,
+	snapshotSerial uint32,
+	currentSerial uint32,
+	valid bool,
+	dirty bool,
+) (uint32, bool) {
+	if !valid || dirty || snapshotSerial != currentSerial || cursor != anchor {
+		return 0, false
+	}
+	if deleteRunes <= 0 || !utf8.ValidString(oldWord) || !utf8.ValidString(surrounding) {
+		return 0, false
+	}
+	runes := []rune(oldWord)
+	if deleteRunes > len(runes) {
+		return 0, false
+	}
+	deletedSuffix := string(runes[len(runes)-deleteRunes:])
+	deleteBytes := len(deletedSuffix)
+	if cursor < deleteBytes || cursor > len(surrounding) {
+		return 0, false
+	}
+	if surrounding[cursor-deleteBytes:cursor] != deletedSuffix {
+		return 0, false
+	}
+	return uint32(deleteBytes), true
+}
+
+// endWord finishes the current word. Text is already committed live, so this
+// only resets the engine.
 func (a *app) endWord() {
-	if a.preedit {
-		a.flushPreedit()
-	} else {
-		a.tx.Reset()
-	}
-}
-
-// togglePreedit switches between direct-commit and preedit modes, flushing any
-// in-progress word so nothing is left half-composed across the switch.
-func (a *app) togglePreedit() {
-	a.endWord()
-	a.preedit = !a.preedit
-	log.Printf("preedit=%v", a.preedit)
+	a.tx.Reset()
 }
 
 // resetPerFocusState drops all state tied to the previously focused client:
-// the composing word, the Backspace-restore stash, the surrounding-text
-// snapshot, and pending key-consume bookkeeping (a release may never arrive
-// after a focus change).
+// the composing word, surrounding-text snapshot, and pending key-consume
+// bookkeeping (a release may never arrive after a focus change).
 func (a *app) resetPerFocusState() {
 	a.tx.Reset()
-	a.restoreRaw, a.restoreWord = "", ""
 	a.surrValid, a.surrPending, a.surrDirty = false, false, false
+	a.surrSerial = 0
 	a.surrText, a.surrPendText = "", ""
 	a.consumed = map[uint32]bool{}
-}
-
-// isAdoptKey reports whether r is a Telex tone/mark key that may edit the
-// committed word next to the cursor: tones s f r x j, horn/breve w, and
-// tone-removal z. Plain letters deliberately start a new word instead.
-func isAdoptKey(r rune) bool {
-	switch r {
-	case 's', 'f', 'r', 'x', 'j', 'w', 'z',
-		'S', 'F', 'R', 'X', 'J', 'W', 'Z':
-		return true
-	}
-	return false
-}
-
-// maxAdoptRunes caps the total length of an adoptable word. A longer
-// unbroken letter run (identifiers in editors, truncated surrounding text)
-// is refused outright — adopting a *partial* word would delete and rewrite
-// the middle of something that is not a word.
-const maxAdoptRunes = 24
-
-// wordAtCursor extracts the committed word the cursor touches from the
-// surrounding-text snapshot: the rune immediately before the cursor must be a
-// word rune (cursor inside or at the end of a word), and the word extends over
-// letters on both sides. Returns the word plus its byte extents before and
-// after the cursor. Refused when there is a selection — typing would replace
-// it, not edit a word — and when the snapshot may be stale (surrDirty).
-func (a *app) wordAtCursor() (word string, beforeBytes, afterBytes int, ok bool) {
-	if !a.surrValid || a.surrDirty || a.surrCursor != a.surrAnchor {
-		return "", 0, 0, false
-	}
-	text, cur := a.surrText, a.surrCursor
-	if cur <= 0 || cur > len(text) {
-		return "", 0, 0, false
-	}
-	runes := 0
-	left := cur
-	for left > 0 {
-		r, size := utf8.DecodeLastRuneInString(text[:left])
-		if r == utf8.RuneError || !engine.IsWordRune(r) {
-			break
-		}
-		if runes++; runes > maxAdoptRunes {
-			return "", 0, 0, false
-		}
-		left -= size
-	}
-	if left == cur {
-		return "", 0, 0, false
-	}
-	right := cur
-	for right < len(text) {
-		r, size := utf8.DecodeRuneInString(text[right:])
-		if r == utf8.RuneError || !engine.IsWordRune(r) {
-			break
-		}
-		if runes++; runes > maxAdoptRunes {
-			return "", 0, 0, false
-		}
-		right += size
-	}
-	return text[left:right], cur - left, right - cur, true
-}
-
-// adoptWord pulls the committed word around the cursor back into the engine
-// and applies the pressed tone/mark key to it. The edit only happens when the
-// key actually transforms the word AND the result still spells like a
-// Vietnamese syllable — so "viet"+j edits to "viẹt" but "hello"+s refuses
-// (bamboo would mangle it to "helló") and falls back to plain typing at the
-// cursor. This first edit replaces the on-screen word atomically via
-// delete_surrounding_text + commit_string (direct) or reopens it as preedit;
-// no fake Backspace, so no ordering race — later keys of the same word go
-// through the normal per-mode paths. The snapshot is consumed either way:
-// one adoption attempt per surrounding_text event.
-func (a *app) adoptWord(r rune) bool {
-	word, before, after, ok := a.wordAtCursor()
-	if !ok {
-		return false
-	}
-	a.surrValid = false
-	newWord, ok := a.tx.AdoptEdit(word, r)
-	if !ok {
-		return false
-	}
-	dbg("adopt %q + %q -> %q (before=%d after=%d)", word, r, newWord, before, after)
-	a.surrDirty = true
-	a.im.DeleteSurroundingText(uint32(before), uint32(after))
-	if a.preedit {
-		a.setPreedit(newWord)
-	} else {
-		a.im.CommitString(newWord)
-		a.im.Commit(a.serial)
-	}
-	return true
 }
 
 func (a *app) sendBackspace() {
@@ -544,7 +574,6 @@ func (a *app) updateModifier(code uint32, pressed bool) {
 		if a.sawCtrlShift && !a.chordOther {
 			a.vnOn = !a.vnOn
 			a.endWord()
-			a.restoreRaw, a.restoreWord = "", ""
 			log.Printf("Vietnamese=%v", a.vnOn)
 		}
 		a.sawCtrlShift = false

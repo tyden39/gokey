@@ -17,6 +17,18 @@ const (
 	KeyRightMeta  = 126
 )
 
+// cursorKeyName names the cursor-movement keys (arrows, Home/End, PageUp/Down).
+var cursorKeyName = map[uint32]string{
+	102: "Home", 103: "Up", 104: "PageUp", 105: "Left",
+	106: "Right", 107: "End", 108: "Down", 109: "PageDown",
+}
+
+// CursorKeyName returns the name of a cursor-movement key and whether code is one.
+func CursorKeyName(code uint32) (string, bool) {
+	name, ok := cursorKeyName[code]
+	return name, ok
+}
+
 // letterCode maps an evdev key code to its US-layout lowercase letter.
 // Only alphabetic keys are relevant for Telex word composition.
 var letterCode = map[uint32]rune{
