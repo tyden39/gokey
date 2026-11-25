@@ -113,6 +113,15 @@ Inside the process, key handling is split into two layers:
    calls `Commit(serial)` once. A failed validation immediately uses the
    virtual-Backspace path for that key.
 
+### Holding Backspace
+
+While a word is composing, GoKey consumes the physical Backspace and applies
+the Telex deletion. It uses the compositor's repeat delay and rate to keep
+deleting while the key is held, including after the word is erased. Releasing
+the key, pressing another key, changing focus, or disabling compositor repeat
+stops the timer. When a press starts outside composition, the focused client
+handles the forwarded Backspace and its repeat.
+
 ### Word ends (Space / punctuation / Enter)
 
 1. `endWord()` resets the engine because the transformed text was committed

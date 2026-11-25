@@ -93,6 +93,10 @@ type app struct {
 	// already moved away from.
 	surrDirty bool
 
+	backspaceTimer *time.Timer
+	repeatInterval time.Duration
+	repeatDelay    time.Duration
+
 	keymapSet bool
 	consumed  map[uint32]bool
 	vkTime    uint32
@@ -135,9 +139,46 @@ func main() {
 	a.setup()
 	log.Printf("gokey running (Telex, Vietnamese=%v, toggle=Ctrl+Shift, app-strategies=%s)", a.vnOn, strategyPath)
 
+	a.run()
+}
+
+// Read Wayland messages while waiting for the repeat timer. Dispatch handlers
+// and repeat actions on the same goroutine so they share the current IME state.
+func (a *app) run() {
+	type message struct {
+		id, opcode uint32
+		fd         int
+		data       []byte
+		err        error
+	}
+	events := make(chan message)
+	go func() {
+		for {
+			id, opcode, fd, data, err := a.ctx.ReadMsg()
+			events <- message{id, opcode, fd, data, err}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
 	for {
-		if err := a.ctx.Dispatch(); err != nil {
-			log.Fatalf("dispatch: %v", err)
+		var repeat <-chan time.Time
+		if a.backspaceTimer != nil {
+			repeat = a.backspaceTimer.C
+		}
+		select {
+		case e := <-events:
+			if e.err != nil {
+				log.Fatalf("read Wayland event: %v", e.err)
+			}
+			sender, ok := a.ctx.GetProxy(e.id).(client.Dispatcher)
+			if !ok {
+				log.Fatalf("dispatch: no dispatcher for object %d", e.id)
+			}
+			sender.Dispatch(e.opcode, e.fd, e.data)
+		case <-repeat:
+			a.repeatBackspace()
 		}
 	}
 }
@@ -258,6 +299,7 @@ func (a *app) setup() {
 	grab.SetKeymapHandler(a.onKeymap)
 	grab.SetModifiersHandler(a.onModifiers)
 	grab.SetKeyHandler(a.onKey)
+	grab.SetRepeatInfoHandler(a.onRepeatInfo)
 }
 
 func (a *app) onKeymap(e inputmethod.ZwpInputMethodKeyboardGrabV2KeymapEvent) {
@@ -281,6 +323,9 @@ func (a *app) onModifiers(e inputmethod.ZwpInputMethodKeyboardGrabV2ModifiersEve
 func (a *app) onKey(e inputmethod.ZwpInputMethodKeyboardGrabV2KeyEvent) {
 	code := e.Key
 	pressed := e.State == keyStatePressed
+	if code == keymap.KeyBackspace || pressed {
+		a.stopBackspaceRepeat()
+	}
 
 	if keymap.IsModifier(code) {
 		a.updateModifier(code, pressed)
@@ -313,10 +358,11 @@ func (a *app) onKey(e inputmethod.ZwpInputMethodKeyboardGrabV2KeyEvent) {
 
 	if code == keymap.KeyBackspace {
 		dbg("backspace received (word empty=%v)", a.tx.Empty())
-		oldWord := a.tx.Current()
-		if del, ins, handled := a.tx.Backspace(); handled {
-			a.apply(oldWord, del, ins)
+		if a.eraseComposingCharacter() {
 			a.consumed[code] = true
+			if a.repeatInterval > 0 {
+				a.backspaceTimer = time.NewTimer(a.repeatDelay)
+			}
 			return
 		}
 		a.forward(e)
@@ -338,6 +384,39 @@ func (a *app) onKey(e inputmethod.ZwpInputMethodKeyboardGrabV2KeyEvent) {
 	// A non-letter key (space, punctuation, Enter) ends the word.
 	a.endWord()
 	a.forward(e)
+}
+
+func (a *app) eraseComposingCharacter() bool {
+	oldWord := a.tx.Current()
+	del, ins, handled := a.tx.Backspace()
+	if handled {
+		a.apply(oldWord, del, ins)
+	}
+	return handled
+}
+
+func (a *app) onRepeatInfo(e inputmethod.ZwpInputMethodKeyboardGrabV2RepeatInfoEvent) {
+	a.repeatDelay = time.Duration(e.Delay) * time.Millisecond
+	a.repeatInterval = 0
+	if e.Rate > 0 {
+		a.repeatInterval = max(time.Nanosecond, time.Second/time.Duration(e.Rate))
+	} else {
+		a.stopBackspaceRepeat()
+	}
+}
+
+func (a *app) repeatBackspace() {
+	if !a.eraseComposingCharacter() {
+		a.sendBackspace()
+	}
+	a.backspaceTimer.Reset(a.repeatInterval)
+}
+
+func (a *app) stopBackspaceRepeat() {
+	if a.backspaceTimer != nil {
+		a.backspaceTimer.Stop()
+		a.backspaceTimer = nil
+	}
 }
 
 // apply chooses the injection strategy for the cached active app. Unsafe or
@@ -514,6 +593,7 @@ func (a *app) endWord() {
 // the composing word, surrounding-text snapshot, and pending key-consume
 // bookkeeping (a release may never arrive after a focus change).
 func (a *app) resetPerFocusState() {
+	a.stopBackspaceRepeat()
 	a.tx.Reset()
 	a.surrValid, a.surrPending, a.surrDirty = false, false, false
 	a.surrSerial = 0

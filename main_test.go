@@ -2,9 +2,14 @@ package main
 
 import (
 	"testing"
+	"time"
+
+	"gokey/engine"
 
 	"gokey/internal/appconfig"
 	"gokey/internal/hyprland"
+	"gokey/internal/inputmethod"
+	"gokey/internal/keymap"
 )
 
 func TestSurroundingDeleteBytes(t *testing.T) {
@@ -132,5 +137,47 @@ func TestCursorContext(t *testing.T) {
 		if got := cursorContext(c.text, c.cursor, c.n); got != c.want {
 			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
 		}
+	}
+}
+
+func TestComposingBackspaceRepeat(t *testing.T) {
+	for _, stop := range []string{"release", "focus change", "repeat disabled"} {
+		t.Run(stop, func(t *testing.T) {
+			a := &app{tx: engine.New(), active: true, vnOn: true, consumed: map[uint32]bool{}}
+			t.Cleanup(a.stopBackspaceRepeat)
+			for _, r := range "ban" {
+				a.tx.ProcessChar(r)
+			}
+			a.onRepeatInfo(inputmethod.ZwpInputMethodKeyboardGrabV2RepeatInfoEvent{Rate: 25, Delay: 300})
+			if a.repeatDelay != 300*time.Millisecond || a.repeatInterval != 40*time.Millisecond {
+				t.Fatal("repeat timing should follow compositor settings")
+			}
+			event := inputmethod.ZwpInputMethodKeyboardGrabV2KeyEvent{Key: keymap.KeyBackspace, State: keyStatePressed}
+			a.onKey(event)
+			if a.tx.Current() != "ba" || a.backspaceTimer == nil {
+				t.Fatal("Backspace should remove one character and schedule repeat")
+			}
+			a.repeatBackspace()
+			a.repeatBackspace()
+			a.repeatBackspace()
+			if !a.tx.Empty() || a.backspaceTimer == nil {
+				t.Fatal("repeat should continue after the composing word is erased")
+			}
+			switch stop {
+			case "release":
+				event.State = 0
+				a.onKey(event)
+				if a.consumed[keymap.KeyBackspace] {
+					t.Fatal("release should clear the consumed press")
+				}
+			case "focus change":
+				a.resetPerFocusState()
+			case "repeat disabled":
+				a.onRepeatInfo(inputmethod.ZwpInputMethodKeyboardGrabV2RepeatInfoEvent{})
+			}
+			if a.backspaceTimer != nil {
+				t.Fatal("repeat should stop")
+			}
+		})
 	}
 }
